@@ -46,6 +46,29 @@ type Settings struct {
 	LogLevel  string `envconfig:"LOG_LEVEL" default:"WARN"`
 	LogFormat string `envconfig:"LOG_FORMAT" default:"text"`
 
+	// Rate limit configuration
+	// ConfigType is the method of configuring rate limits. Possible values "FILE", "GRPC_XDS_SOTW".
+	ConfigType string `envconfig:"CONFIG_TYPE" default:"FILE"`
+	// ForceStartWithoutInitialConfig enables start the server without initial rate limit config event
+	ForceStartWithoutInitialConfig bool `envconfig:"FORCE_START_WITHOUT_INITIAL_CONFIG" default:"false"`
+
+	// xDS rate limit configuration
+	// ConfigGrpcXdsNodeId is the Node ID. xDS server should set snapshots to this Node ID
+	ConfigGrpcXdsNodeId                     string            `envconfig:"CONFIG_GRPC_XDS_NODE_ID" default:"default"`
+	ConfigGrpcXdsNodeMetadata               string            `envconfig:"CONFIG_GRPC_XDS_NODE_METADATA" default:""` // eg: "key1:val1,key2=val2"
+	ConfigGrpcXdsServerUrl                  string            `envconfig:"CONFIG_GRPC_XDS_SERVER_URL" default:"localhost:18000"`
+	ConfigGrpcXdsServerConnectRetryInterval time.Duration     `envconfig:"CONFIG_GRPC_XDS_SERVER_CONNECT_RETRY_INTERVAL" default:"3s"`
+	ConfigGrpcXdsClientAdditionalHeaders    map[string]string `envconfig:"CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS" default:""`
+
+	// xDS config server TLS configurations
+	ConfigGrpcXdsTlsConfig       *tls.Config
+	ConfigGrpcXdsServerUseTls    bool   `envconfig:"CONFIG_GRPC_XDS_SERVER_USE_TLS" default:"false"`
+	ConfigGrpcXdsClientTlsCert   string `envconfig:"CONFIG_GRPC_XDS_CLIENT_TLS_CERT" default:""`
+	ConfigGrpcXdsClientTlsKey    string `envconfig:"CONFIG_GRPC_XDS_CLIENT_TLS_KEY" default:""`
+	ConfigGrpcXdsServerTlsCACert string `envconfig:"CONFIG_GRPC_XDS_SERVER_TLS_CACERT" default:""`
+	// GrpcClientTlsSAN is the SAN to validate from the client cert during mTLS auth
+	ConfigGrpcXdsServerTlsSAN string `envconfig:"CONFIG_GRPC_XDS_SERVER_TLS_SAN" default:""`
+
 	// Stats-related settings
 	UseStatsd  bool              `envconfig:"USE_STATSD" default:"true"`
 	StatsdHost string            `envconfig:"STATSD_HOST" default:"localhost"`
@@ -55,6 +78,7 @@ type Settings struct {
 	// Settings for rate limit configuration
 	RuntimePath           string `envconfig:"RUNTIME_ROOT" default:"/srv/runtime_data/current"`
 	RuntimeSubdirectory   string `envconfig:"RUNTIME_SUBDIRECTORY"`
+	RuntimeAppDirectory   string `envconfig:"RUNTIME_APPDIRECTORY" default:"config"`
 	RuntimeIgnoreDotFiles bool   `envconfig:"RUNTIME_IGNOREDOTFILES" default:"false"`
 	RuntimeWatchRoot      bool   `envconfig:"RUNTIME_WATCH_ROOT" default:"true"`
 
@@ -73,6 +97,9 @@ type Settings struct {
 	HeaderRatelimitRemaining string `envconfig:"LIMIT_REMAINING_HEADER" default:"RateLimit-Remaining"`
 	// value: remaining seconds
 	HeaderRatelimitReset string `envconfig:"LIMIT_RESET_HEADER" default:"RateLimit-Reset"`
+
+	// Health-check settings
+	HealthyWithAtLeastOneConfigLoaded bool `envconfig:"HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED" default:"false"`
 
 	// Redis settings
 	RedisSocketType string `envconfig:"REDIS_SOCKET_TYPE" default:"unix"`
@@ -149,6 +176,7 @@ func NewSettings() Settings {
 	// When we require TLS to connect to Redis, we check if we need to connect using the provided key-pair.
 	RedisTlsConfig(s.RedisTls || s.RedisPerSecondTls)(&s)
 	GrpcServerTlsConfig()(&s)
+	ConfigGrpcXdsServerTlsConfig()(&s)
 	return s
 }
 
@@ -174,6 +202,20 @@ func GrpcServerTlsConfig() Option {
 				grpcServerTlsConfig.ClientAuth = tls.NoClientCert
 			}
 			s.GrpcServerTlsConfig = grpcServerTlsConfig
+		}
+	}
+}
+
+func ConfigGrpcXdsServerTlsConfig() Option {
+	return func(s *Settings) {
+		if s.ConfigGrpcXdsServerUseTls {
+			configGrpcXdsServerTlsConfig := utils.TlsConfigFromFiles(s.ConfigGrpcXdsClientTlsCert, s.ConfigGrpcXdsClientTlsKey, s.ConfigGrpcXdsServerTlsCACert, utils.ServerCA)
+			if s.ConfigGrpcXdsServerTlsCACert != "" {
+				configGrpcXdsServerTlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			} else {
+				configGrpcXdsServerTlsConfig.ClientAuth = tls.NoClientCert
+			}
+			s.ConfigGrpcXdsTlsConfig = configGrpcXdsServerTlsConfig
 		}
 	}
 }

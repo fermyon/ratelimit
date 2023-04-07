@@ -17,13 +17,14 @@ func (e RateLimitConfigError) Error() string {
 
 // Wrapper for an individual rate limit config entry which includes the defined limit and stats.
 type RateLimit struct {
-	FullKey    string
-	Stats      stats.RateLimitStats
-	Limit      *pb.RateLimitResponse_RateLimit
-	Unlimited  bool
-	ShadowMode bool
-	Name       string
-	Replaces   []string
+	FullKey                              string
+	Stats                                stats.RateLimitStats
+	Limit                                *pb.RateLimitResponse_RateLimit
+	Unlimited                            bool
+	ShadowMode                           bool
+	Name                                 string
+	Replaces                             []string
+	IncludeValueInMetricWhenNotSpecified bool
 }
 
 // Interface for interacting with a loaded rate limit config.
@@ -37,12 +38,15 @@ type RateLimitConfig interface {
 	// @param descriptor supplies the descriptor to look up.
 	// @return a rate limit to apply or nil if no rate limit is configured for the descriptor.
 	GetLimit(ctx context.Context, domain string, descriptor *pb_struct.RateLimitDescriptor) *RateLimit
+
+	// Check if the domains is empty which corresponds to no config loaded.
+	IsEmptyDomains() bool
 }
 
 // Information for a config file to load into the aggregate config.
 type RateLimitConfigToLoad struct {
-	Name      string
-	FileBytes string
+	Name       string
+	ConfigYaml *YamlRoot
 }
 
 // Interface for loading a configuration from a list of YAML files.

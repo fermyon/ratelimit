@@ -48,6 +48,7 @@ func defaultSettings() settings.Settings {
 	// Set some convenient defaults for all integration tests.
 	s.RuntimePath = "runtime/current"
 	s.RuntimeSubdirectory = "ratelimit"
+	s.RuntimeAppDirectory = "config"
 	s.RedisPerSecondSocketType = "tcp"
 	s.RedisSocketType = "tcp"
 	s.DebugPort = 8084
@@ -92,6 +93,20 @@ func TestBasicConfig(t *testing.T) {
 		cacheSettings := makeSimpleRedisSettings(6383, 6380, false, 0)
 		cacheSettings.CacheKeyPrefix = "prefix:"
 		t.Run("WithoutPerSecondRedisWithCachePrefix", testBasicConfig(cacheSettings))
+	})
+}
+
+func TestXdsProviderBasicConfig(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+		{Port: 6380},
+	}, func() {
+		_, cancel := startXdsSotwServer(t)
+		defer cancel()
+		t.Run("WithoutPerSecondRedis", testXdsProviderBasicConfig(false, 0))
+		t.Run("WithPerSecondRedis", testXdsProviderBasicConfig(true, 0))
+		t.Run("WithoutPerSecondRedisWithLocalCache", testXdsProviderBasicConfig(false, 1000))
+		t.Run("WithPerSecondRedisWithLocalCache", testXdsProviderBasicConfig(true, 1000))
 	})
 }
 
@@ -178,6 +193,17 @@ func TestBasicReloadConfig(t *testing.T) {
 	}, func() {
 		t.Run("BasicWithoutWatchRoot", testBasicConfigWithoutWatchRoot(false, 0))
 		t.Run("ReloadWithoutWatchRoot", testBasicConfigReload(false, 0, false))
+	})
+}
+
+func TestXdsProviderBasicConfigReload(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+	}, func() {
+		setSnapshotFunc, cancel := startXdsSotwServer(t)
+		defer cancel()
+
+		t.Run("ReloadConfigWithXdsServer", testXdsProviderBasicConfigReload(setSnapshotFunc, false, 0))
 	})
 }
 
@@ -381,7 +407,7 @@ func testBasicConfigWithoutWatchRootWithRedisSentinel(perSecond bool, local_cach
 func testBasicConfigReload(perSecond bool, local_cache_size int, runtimeWatchRoot bool) func(*testing.T) {
 	s := makeSimpleRedisSettings(6383, 6380, perSecond, local_cache_size)
 	s.RuntimeWatchRoot = runtimeWatchRoot
-	return testConfigReload(s)
+	return testConfigReload(s, reloadNewConfigFile, restoreConfigFile)
 }
 
 func testBasicConfigReloadWithRedisCluster(perSecond bool, local_cache_size int, runtimeWatchRoot string) func(*testing.T) {
@@ -395,7 +421,7 @@ func testBasicConfigReloadWithRedisCluster(perSecond bool, local_cache_size int,
 
 	configRedisCluster(&s)
 
-	return testConfigReload(s)
+	return testConfigReload(s, reloadNewConfigFile, restoreConfigFile)
 }
 
 func testBasicConfigReloadWithRedisSentinel(perSecond bool, local_cache_size int, runtimeWatchRoot bool) func(*testing.T) {
@@ -409,7 +435,7 @@ func testBasicConfigReloadWithRedisSentinel(perSecond bool, local_cache_size int
 
 	s.RuntimeWatchRoot = runtimeWatchRoot
 
-	return testConfigReload(s)
+	return testConfigReload(s, reloadNewConfigFile, restoreConfigFile)
 }
 
 func getCacheKey(cacheKey string, enableLocalCache bool) string {
@@ -671,7 +697,7 @@ func startTestRunner(t *testing.T, s settings.Settings) *runner.Runner {
 	return &runner
 }
 
-func testConfigReload(s settings.Settings) func(*testing.T) {
+func testConfigReload(s settings.Settings, reloadConfFunc, restoreConfFunc func()) func(*testing.T) {
 	return func(t *testing.T) {
 		enable_local_cache := s.LocalCacheSizeInBytes > 0
 		runner := startTestRunner(t, s)
@@ -698,26 +724,7 @@ func testConfigReload(s settings.Settings) func(*testing.T) {
 		runner.GetStatsStore().Flush()
 		loadCountBefore := runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
 
-		// Copy a new file to config folder to test config reload functionality
-		in, err := os.Open("runtime/current/ratelimit/reload.yaml")
-		if err != nil {
-			panic(err)
-		}
-		defer in.Close()
-		out, err := os.Create("runtime/current/ratelimit/config/reload.yaml")
-		if err != nil {
-			panic(err)
-		}
-		defer out.Close()
-		_, err = io.Copy(out, in)
-		if err != nil {
-			panic(err)
-		}
-		err = out.Close()
-		if err != nil {
-			panic(err)
-		}
-
+		reloadConfFunc()
 		loadCountAfter, reloaded := waitForConfigReload(runner, loadCountBefore)
 
 		assert.True(reloaded)
@@ -739,16 +746,41 @@ func testConfigReload(s settings.Settings) func(*testing.T) {
 			response)
 		assert.NoError(err)
 
-		err = os.Remove("runtime/current/ratelimit/config/reload.yaml")
-		if err != nil {
-			panic(err)
-		}
-
+		restoreConfFunc()
 		// Removal of config files must trigger a reload
 		loadCountBefore = loadCountAfter
 		loadCountAfter, reloaded = waitForConfigReload(runner, loadCountBefore)
 		assert.True(reloaded)
 		assert.Greater(loadCountAfter, loadCountBefore)
+	}
+}
+
+func reloadNewConfigFile() {
+	// Copy a new file to config folder to test config reload functionality
+	in, err := os.Open("runtime/current/ratelimit/reload.yaml")
+	if err != nil {
+		panic(err)
+	}
+	defer in.Close()
+	out, err := os.Create("runtime/current/ratelimit/config/reload.yaml")
+	if err != nil {
+		panic(err)
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	if err != nil {
+		panic(err)
+	}
+	err = out.Close()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func restoreConfigFile() {
+	err := os.Remove("runtime/current/ratelimit/config/reload.yaml")
+	if err != nil {
+		panic(err)
 	}
 }
 

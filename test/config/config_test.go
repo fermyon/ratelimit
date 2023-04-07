@@ -21,7 +21,8 @@ func loadFile(path string) []config.RateLimitConfigToLoad {
 	if err != nil {
 		panic(err)
 	}
-	return []config.RateLimitConfigToLoad{{path, string(contents)}}
+	configYaml := config.ConfigFileContentToYaml(path, string(contents))
+	return []config.RateLimitConfigToLoad{{Name: path, ConfigYaml: configYaml}}
 }
 
 func TestBasicConfig(t *testing.T) {
@@ -29,6 +30,7 @@ func TestBasicConfig(t *testing.T) {
 	stats := stats.NewStore(stats.NewNullSink(), false)
 	rlConfig := config.NewRateLimitConfigImpl(loadFile("basic_config.yaml"), mockstats.NewMockStatManager(stats), false)
 	rlConfig.Dump()
+	assert.Equal(rlConfig.IsEmptyDomains(), false)
 	assert.Nil(rlConfig.GetLimit(nil, "foo_domain", &pb_struct.RateLimitDescriptor{}))
 	assert.Nil(rlConfig.GetLimit(nil, "test-domain", &pb_struct.RateLimitDescriptor{}))
 
@@ -177,6 +179,42 @@ func TestBasicConfig(t *testing.T) {
 	assert.True(rl.Unlimited)
 	assert.EqualValues(1, stats.NewCounter("test-domain.key6.total_hits").Value())
 	assert.EqualValues(1, stats.NewCounter("test-domain.key6.within_limit").Value())
+
+	// A value for the key with detailed_metric: true
+	// should also generate a stat with the value included
+	rl = rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "key7", Value: "unspecified_value"}},
+		})
+	rl.Stats.TotalHits.Inc()
+	rl.Stats.OverLimit.Inc()
+	rl.Stats.NearLimit.Inc()
+	rl.Stats.WithinLimit.Inc()
+	assert.EqualValues(70, rl.Limit.RequestsPerUnit)
+	assert.Equal(pb.RateLimitResponse_RateLimit_MINUTE, rl.Limit.Unit)
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_unspecified_value.total_hits").Value())
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_unspecified_value.over_limit").Value())
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_unspecified_value.near_limit").Value())
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_unspecified_value.within_limit").Value())
+
+	// Another value for the key with detailed_metric: true
+	// should also generate a stat with the value included
+	rl = rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "key7", Value: "another_value"}},
+		})
+	rl.Stats.TotalHits.Inc()
+	rl.Stats.OverLimit.Inc()
+	rl.Stats.NearLimit.Inc()
+	rl.Stats.WithinLimit.Inc()
+	assert.EqualValues(70, rl.Limit.RequestsPerUnit)
+	assert.Equal(pb.RateLimitResponse_RateLimit_MINUTE, rl.Limit.Unit)
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_another_value.total_hits").Value())
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_another_value.over_limit").Value())
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_another_value.near_limit").Value())
+	assert.EqualValues(1, stats.NewCounter("test-domain.key7_another_value.within_limit").Value())
 }
 
 func TestDomainMerge(t *testing.T) {
@@ -526,4 +564,63 @@ func TestShadowModeConfig(t *testing.T) {
 	assert.EqualValues(1, stats.NewCounter("test-domain.key2_value2.over_limit").Value())
 	assert.EqualValues(1, stats.NewCounter("test-domain.key2_value2.near_limit").Value())
 	assert.EqualValues(0, stats.NewCounter("test-domain.key2_value2.shadow_mode").Value())
+}
+
+func TestWildcardConfig(t *testing.T) {
+	assert := assert.New(t)
+	stats := stats.NewStore(stats.NewNullSink(), false)
+	rlConfig := config.NewRateLimitConfigImpl(loadFile("wildcard.yaml"), mockstats.NewMockStatManager(stats), false)
+	rlConfig.Dump()
+
+	// Baseline to show wildcard works like no value
+	withoutVal1 := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "noVal", Value: "foo1"}},
+		})
+	withoutVal2 := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "noVal", Value: "foo2"}},
+		})
+	assert.NotNil(withoutVal1)
+	assert.Equal(withoutVal1, withoutVal2)
+
+	// Matches multiple wildcard values and results are equal
+	wildcard1 := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "wild", Value: "foo1"}},
+		})
+	wildcard2 := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "wild", Value: "foo2"}},
+		})
+	assert.NotNil(wildcard1)
+	assert.Equal(wildcard1, wildcard2)
+
+	// Doesn't match non-matching values
+	noMatch := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "wild", Value: "bar"}},
+		})
+	assert.Nil(noMatch)
+
+	// Non-wildcard values don't eager match
+	eager := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "noWild", Value: "foo1"}},
+		})
+	assert.Nil(eager)
+
+	// Wildcard in the middle of value is not supported.
+	midWildcard := rlConfig.GetLimit(
+		nil, "test-domain",
+		&pb_struct.RateLimitDescriptor{
+			Entries: []*pb_struct.RateLimitDescriptor_Entry{{Key: "midWildcard", Value: "barab"}},
+		})
+	assert.Nil(midWildcard)
 }

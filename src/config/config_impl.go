@@ -17,7 +17,7 @@ type yamlReplaces struct {
 	Name string
 }
 
-type yamlRateLimit struct {
+type YamlRateLimit struct {
 	RequestsPerUnit uint32 `yaml:"requests_per_unit"`
 	Unit            string
 	Unlimited       bool `yaml:"unlimited"`
@@ -25,22 +25,24 @@ type yamlRateLimit struct {
 	Replaces        []yamlReplaces
 }
 
-type yamlDescriptor struct {
-	Key         string
-	Value       string
-	RateLimit   *yamlRateLimit `yaml:"rate_limit"`
-	Descriptors []yamlDescriptor
-	ShadowMode  bool `yaml:"shadow_mode"`
+type YamlDescriptor struct {
+	Key                               string
+	Value                             string
+	RateLimit                         *YamlRateLimit `yaml:"rate_limit"`
+	Descriptors                       []YamlDescriptor
+	ShadowMode                        bool `yaml:"shadow_mode"`
+	IncludeMetricsForUnspecifiedValue bool `yaml:"detailed_metric"`
 }
 
-type yamlRoot struct {
+type YamlRoot struct {
 	Domain      string
-	Descriptors []yamlDescriptor
+	Descriptors []YamlDescriptor
 }
 
 type rateLimitDescriptor struct {
-	descriptors map[string]*rateLimitDescriptor
-	limit       *RateLimit
+	descriptors  map[string]*rateLimitDescriptor
+	limit        *RateLimit
+	wildcardKeys []string
 }
 
 type rateLimitDomain struct {
@@ -65,6 +67,7 @@ var validKeys = map[string]bool{
 	"shadow_mode":       true,
 	"name":              true,
 	"replaces":          true,
+	"detailed_metric":   true,
 }
 
 // Create a new rate limit config entry.
@@ -74,7 +77,7 @@ var validKeys = map[string]bool{
 // @param unlimited supplies whether the rate limit is unlimited
 // @return the new config entry.
 func NewRateLimit(requestsPerUnit uint32, unit pb.RateLimitResponse_RateLimit_Unit, rlStats stats.RateLimitStats,
-	unlimited bool, shadowMode bool, name string, replaces []string) *RateLimit {
+	unlimited bool, shadowMode bool, name string, replaces []string, includeValueInMetricWhenNotSpecified bool) *RateLimit {
 
 	return &RateLimit{
 		FullKey: rlStats.GetKey(),
@@ -83,10 +86,11 @@ func NewRateLimit(requestsPerUnit uint32, unit pb.RateLimitResponse_RateLimit_Un
 			RequestsPerUnit: requestsPerUnit,
 			Unit:            unit,
 		},
-		Unlimited:  unlimited,
-		ShadowMode: shadowMode,
-		Name:       name,
-		Replaces:   replaces,
+		Unlimited:                            unlimited,
+		ShadowMode:                           shadowMode,
+		Name:                                 name,
+		Replaces:                             replaces,
+		IncludeValueInMetricWhenNotSpecified: includeValueInMetricWhenNotSpecified,
 	}
 }
 
@@ -107,8 +111,8 @@ func (this *rateLimitDescriptor) dump() string {
 // Create a new config error which includes the owning file.
 // @param config supplies the config file that generated the error.
 // @param err supplies the error string.
-func newRateLimitConfigError(config RateLimitConfigToLoad, err string) RateLimitConfigError {
-	return RateLimitConfigError(fmt.Sprintf("%s: %s", config.Name, err))
+func newRateLimitConfigError(name string, err string) RateLimitConfigError {
+	return RateLimitConfigError(fmt.Sprintf("%s: %s", name, err))
 }
 
 // Load a set of config descriptors from the YAML file and check the input.
@@ -116,10 +120,10 @@ func newRateLimitConfigError(config RateLimitConfigToLoad, err string) RateLimit
 // @param parentKey supplies the fully resolved key name that owns this config level.
 // @param descriptors supplies the YAML descriptors to load.
 // @param statsManager that owns the stats.Scope.
-func (this *rateLimitDescriptor) loadDescriptors(config RateLimitConfigToLoad, parentKey string, descriptors []yamlDescriptor, statsManager stats.Manager) {
+func (this *rateLimitDescriptor) loadDescriptors(config RateLimitConfigToLoad, parentKey string, descriptors []YamlDescriptor, statsManager stats.Manager) {
 	for _, descriptorConfig := range descriptors {
 		if descriptorConfig.Key == "" {
-			panic(newRateLimitConfigError(config, "descriptor has empty key"))
+			panic(newRateLimitConfigError(config.Name, "descriptor has empty key"))
 		}
 
 		// Value is optional, so the final key for the map is either the key only or key_value.
@@ -131,7 +135,7 @@ func (this *rateLimitDescriptor) loadDescriptors(config RateLimitConfigToLoad, p
 		newParentKey := parentKey + finalKey
 		if _, present := this.descriptors[finalKey]; present {
 			panic(newRateLimitConfigError(
-				config, fmt.Sprintf("duplicate descriptor composite key '%s'", newParentKey)))
+				config.Name, fmt.Sprintf("duplicate descriptor composite key '%s'", newParentKey)))
 		}
 
 		var rateLimit *RateLimit = nil
@@ -146,12 +150,12 @@ func (this *rateLimitDescriptor) loadDescriptors(config RateLimitConfigToLoad, p
 			if unlimited {
 				if validUnit {
 					panic(newRateLimitConfigError(
-						config,
+						config.Name,
 						fmt.Sprintf("should not specify rate limit unit when unlimited")))
 				}
 			} else if !validUnit {
 				panic(newRateLimitConfigError(
-					config,
+					config.Name,
 					fmt.Sprintf("invalid rate limit unit '%s'", descriptorConfig.RateLimit.Unit)))
 			}
 
@@ -163,7 +167,7 @@ func (this *rateLimitDescriptor) loadDescriptors(config RateLimitConfigToLoad, p
 			rateLimit = NewRateLimit(
 				descriptorConfig.RateLimit.RequestsPerUnit, pb.RateLimitResponse_RateLimit_Unit(value),
 				statsManager.NewStats(newParentKey), unlimited, descriptorConfig.ShadowMode,
-				descriptorConfig.RateLimit.Name, replaces,
+				descriptorConfig.RateLimit.Name, replaces, descriptorConfig.IncludeMetricsForUnspecifiedValue,
 			)
 			rateLimitDebugString = fmt.Sprintf(
 				" ratelimit={requests_per_unit=%d, unit=%s, unlimited=%t, shadow_mode=%t}", rateLimit.Limit.RequestsPerUnit,
@@ -171,36 +175,41 @@ func (this *rateLimitDescriptor) loadDescriptors(config RateLimitConfigToLoad, p
 
 			for _, replaces := range descriptorConfig.RateLimit.Replaces {
 				if replaces.Name == "" {
-					panic(newRateLimitConfigError(config, "should not have an empty replaces entry"))
+					panic(newRateLimitConfigError(config.Name, "should not have an empty replaces entry"))
 				}
 				if replaces.Name == descriptorConfig.RateLimit.Name {
-					panic(newRateLimitConfigError(config, "replaces should not contain name of same descriptor"))
+					panic(newRateLimitConfigError(config.Name, "replaces should not contain name of same descriptor"))
 				}
 			}
 		}
 
 		logger.Debugf(
 			"loading descriptor: key=%s%s", newParentKey, rateLimitDebugString)
-		newDescriptor := &rateLimitDescriptor{map[string]*rateLimitDescriptor{}, rateLimit}
+		newDescriptor := &rateLimitDescriptor{map[string]*rateLimitDescriptor{}, rateLimit, nil}
 		newDescriptor.loadDescriptors(config, newParentKey+".", descriptorConfig.Descriptors, statsManager)
 		this.descriptors[finalKey] = newDescriptor
+
+		// Preload keys ending with "*" symbol.
+		if finalKey[len(finalKey)-1:] == "*" {
+			this.wildcardKeys = append(this.wildcardKeys, finalKey)
+		}
 	}
 }
 
 // Validate a YAML config file's keys.
 // @param config specifies the file contents to load.
 // @param any specifies the yaml file and a map.
-func validateYamlKeys(config RateLimitConfigToLoad, config_map map[interface{}]interface{}) {
+func validateYamlKeys(fileName string, config_map map[interface{}]interface{}) {
 	for k, v := range config_map {
 		if _, ok := k.(string); !ok {
 			errorText := fmt.Sprintf("config error, key is not of type string: %v", k)
 			logger.Debugf(errorText)
-			panic(newRateLimitConfigError(config, errorText))
+			panic(newRateLimitConfigError(fileName, errorText))
 		}
 		if _, ok := validKeys[k.(string)]; !ok {
 			errorText := fmt.Sprintf("config error, unknown key '%s'", k)
 			logger.Debugf(errorText)
-			panic(newRateLimitConfigError(config, errorText))
+			panic(newRateLimitConfigError(fileName, errorText))
 		}
 		switch v := v.(type) {
 		case []interface{}:
@@ -208,13 +217,13 @@ func validateYamlKeys(config RateLimitConfigToLoad, config_map map[interface{}]i
 				if _, ok := e.(map[interface{}]interface{}); !ok {
 					errorText := fmt.Sprintf("config error, yaml file contains list of type other than map: %v", e)
 					logger.Debugf(errorText)
-					panic(newRateLimitConfigError(config, errorText))
+					panic(newRateLimitConfigError(fileName, errorText))
 				}
 				element := e.(map[interface{}]interface{})
-				validateYamlKeys(config, element)
+				validateYamlKeys(fileName, element)
 			}
 		case map[interface{}]interface{}:
-			validateYamlKeys(config, v)
+			validateYamlKeys(fileName, v)
 		// string is a leaf type in ratelimit config. No need to keep validating.
 		case string:
 		// int is a leaf type in ratelimit config. No need to keep validating.
@@ -227,40 +236,24 @@ func validateYamlKeys(config RateLimitConfigToLoad, config_map map[interface{}]i
 		default:
 			errorText := fmt.Sprintf("error checking config")
 			logger.Debugf(errorText)
-			panic(newRateLimitConfigError(config, errorText))
+			panic(newRateLimitConfigError(fileName, errorText))
 		}
 	}
 }
 
-// Load a single YAML config file into the global config.
-// @param config specifies the file contents to load.
+// Load a single YAML config into the global config.
+// @param config specifies the yamlRoot struct to load.
 func (this *rateLimitConfigImpl) loadConfig(config RateLimitConfigToLoad) {
-	// validate keys in config with generic map
-	any := map[interface{}]interface{}{}
-	err := yaml.Unmarshal([]byte(config.FileBytes), &any)
-	if err != nil {
-		errorText := fmt.Sprintf("error loading config file: %s", err.Error())
-		logger.Debugf(errorText)
-		panic(newRateLimitConfigError(config, errorText))
-	}
-	validateYamlKeys(config, any)
-
-	var root yamlRoot
-	err = yaml.Unmarshal([]byte(config.FileBytes), &root)
-	if err != nil {
-		errorText := fmt.Sprintf("error loading config file: %s", err.Error())
-		logger.Debugf(errorText)
-		panic(newRateLimitConfigError(config, errorText))
-	}
+	root := config.ConfigYaml
 
 	if root.Domain == "" {
-		panic(newRateLimitConfigError(config, "config file cannot have empty domain"))
+		panic(newRateLimitConfigError(config.Name, "config file cannot have empty domain"))
 	}
 
 	if _, present := this.domains[root.Domain]; present {
 		if !this.mergeDomainConfigs {
 			panic(newRateLimitConfigError(
-				config, fmt.Sprintf("duplicate domain '%s' in config file", root.Domain)))
+				config.Name, fmt.Sprintf("duplicate domain '%s' in config file", root.Domain)))
 		}
 
 		logger.Debugf("patching domain: %s", root.Domain)
@@ -269,7 +262,7 @@ func (this *rateLimitConfigImpl) loadConfig(config RateLimitConfigToLoad) {
 	}
 
 	logger.Debugf("loading domain: %s", root.Domain)
-	newDomain := &rateLimitDomain{rateLimitDescriptor{map[string]*rateLimitDescriptor{}, nil}}
+	newDomain := &rateLimitDomain{rateLimitDescriptor{map[string]*rateLimitDescriptor{}, nil, nil}}
 	newDomain.loadDescriptors(config, root.Domain+".", root.Descriptors, this.statsManager)
 	this.domains[root.Domain] = newDomain
 }
@@ -306,6 +299,7 @@ func (this *rateLimitConfigImpl) GetLimit(
 			false,
 			"",
 			[]string{},
+			false,
 		)
 		return rateLimit
 	}
@@ -317,6 +311,16 @@ func (this *rateLimitConfigImpl) GetLimit(
 		finalKey := entry.Key + "_" + entry.Value
 		logger.Debugf("looking up key: %s", finalKey)
 		nextDescriptor := descriptorsMap[finalKey]
+
+		if nextDescriptor == nil && len(value.wildcardKeys) > 0 {
+			for _, wildcardKey := range value.wildcardKeys {
+				if strings.HasPrefix(finalKey, strings.TrimSuffix(wildcardKey, "*")) {
+					nextDescriptor = descriptorsMap[wildcardKey]
+					break
+				}
+			}
+		}
+
 		if nextDescriptor == nil {
 			finalKey = entry.Key
 			logger.Debugf("looking up key: %s", finalKey)
@@ -325,6 +329,7 @@ func (this *rateLimitConfigImpl) GetLimit(
 
 		if nextDescriptor != nil && nextDescriptor.limit != nil {
 			logger.Debugf("found rate limit: %s", finalKey)
+
 			if i == len(descriptor.Entries)-1 {
 				rateLimit = nextDescriptor.limit
 			} else {
@@ -336,11 +341,19 @@ func (this *rateLimitConfigImpl) GetLimit(
 			logger.Debugf("iterating to next level")
 			descriptorsMap = nextDescriptor.descriptors
 		} else {
+			if rateLimit != nil && rateLimit.IncludeValueInMetricWhenNotSpecified {
+				rateLimit = NewRateLimit(rateLimit.Limit.RequestsPerUnit, rateLimit.Limit.Unit, this.statsManager.NewStats(rateLimit.FullKey+"_"+entry.Value), rateLimit.Unlimited, rateLimit.ShadowMode, rateLimit.Name, rateLimit.Replaces, false)
+			}
+
 			break
 		}
 	}
 
 	return rateLimit
+}
+
+func (this *rateLimitConfigImpl) IsEmptyDomains() bool {
+	return len(this.domains) == 0
 }
 
 func descriptorKey(domain string, descriptor *pb_struct.RateLimitDescriptor) string {
@@ -355,6 +368,31 @@ func descriptorKey(domain string, descriptor *pb_struct.RateLimitDescriptor) str
 		}
 	}
 	return domain + "." + rateLimitKey
+}
+
+// ConfigFileContentToYaml converts a single YAML (string content) into yamlRoot struct with validating yaml keys.
+// @param fileName specifies the name of the file.
+// @param content specifies the string content of the yaml file.
+func ConfigFileContentToYaml(fileName, content string) *YamlRoot {
+	// validate keys in config with generic map
+	any := map[interface{}]interface{}{}
+	err := yaml.Unmarshal([]byte(content), &any)
+	if err != nil {
+		errorText := fmt.Sprintf("error loading config file: %s", err.Error())
+		logger.Debugf(errorText)
+		panic(newRateLimitConfigError(fileName, errorText))
+	}
+	validateYamlKeys(fileName, any)
+
+	var root YamlRoot
+	err = yaml.Unmarshal([]byte(content), &root)
+	if err != nil {
+		errorText := fmt.Sprintf("error loading config file: %s", err.Error())
+		logger.Debugf(errorText)
+		panic(newRateLimitConfigError(fileName, errorText))
+	}
+
+	return &root
 }
 
 // Create rate limit config from a list of input YAML files.

@@ -7,7 +7,8 @@
   - [API Deprecation History](#api-deprecation-history)
 - [Building and Testing](#building-and-testing)
   - [Docker-compose setup](#docker-compose-setup)
-  - [Full test environment](#full-test-environment)
+  - [Full test environment - Configure rate limits through files](#full-test-environment---configure-rate-limits-through-files)
+  - [Full test environment - Configure rate limits through an xDS Management Server](#full-test-environment---configure-rate-limits-through-an-xds-management-server)
   - [Self-contained end-to-end integration test](#self-contained-end-to-end-integration-test)
 - [Configuration](#configuration)
   - [The configuration format](#the-configuration-format)
@@ -16,6 +17,7 @@
     - [Rate limit definition](#rate-limit-definition)
     - [Replaces](#replaces)
     - [ShadowMode](#shadowmode)
+    - [Including detailed metrics for unspecified values](#including-detailed-metrics-for-unspecified-values)
     - [Examples](#examples)
       - [Example 1](#example-1)
       - [Example 2](#example-2)
@@ -24,9 +26,15 @@
       - [Example 5](#example-5)
       - [Example 6](#example-6)
       - [Example 7](#example-7)
+      - [Example 8](#example-8)
+      - [Example 9](#example-9)
   - [Loading Configuration](#loading-configuration)
+    - [File Based Configuration Loading](#file-based-configuration-loading)
+    - [xDS Management Server Based Configuration Loading](#xds-management-server-based-configuration-loading)
   - [Log Format](#log-format)
   - [GRPC Keepalive](#grpc-keepalive)
+  - [Health-check](#health-check)
+    - [Health-check configurations](#health-check-configurations)
 - [Request Fields](#request-fields)
 - [GRPC Client](#grpc-client)
   - [Commandline flags](#commandline-flags)
@@ -111,7 +119,7 @@ Support for [v2 rls proto](https://github.com/envoyproxy/data-plane-api/blob/mas
   ```
 - To run the server locally using some sensible default settings you can do this (this will setup the server to read the configuration files from the path you specify):
   ```bash
-  USE_STATSD=false LOG_LEVEL=debug REDIS_SOCKET_TYPE=tcp REDIS_URL=localhost:6379 RUNTIME_ROOT=/home/user/src/runtime/data RUNTIME_SUBDIRECTORY=ratelimit
+  USE_STATSD=false LOG_LEVEL=debug REDIS_SOCKET_TYPE=tcp REDIS_URL=localhost:6379 RUNTIME_ROOT=/home/user/src/runtime/data RUNTIME_SUBDIRECTORY=ratelimit RUNTIME_APPDIRECTORY=config
   ```
 
 ## Docker-compose setup
@@ -129,11 +137,12 @@ If you want to run with [two redis instances](#two-redis-instances), you will ne
 the docker-compose.yml file to run a second redis container, and change the environment variables
 as explained in the [two redis instances](#two-redis-instances) section.
 
-## Full test environment
+## Full test environment - Configure rate limits through files
 
 To run a fully configured environment to demo Envoy based rate limiting, run:
 
 ```bash
+export CONFIG_TYPE=FILE
 docker-compose -f docker-compose-example.yml up --build --remove-orphans
 ```
 
@@ -152,6 +161,36 @@ curl localhost:8888/twoheader -H "foo: foo" -H "baz: not-so-shady" # This is sub
 Edit `examples/ratelimit/config/example.yaml` to test different rate limit configs. Hot reloading is enabled.
 
 The descriptors in `example.yaml` and the actions in `examples/envoy/proxy.yaml` should give you a good idea on how to configure rate limits.
+
+To see the metrics in the example
+
+```bash
+# The metrics for the shadow_mode keys
+curl http://localhost:9102/metrics | grep -i shadow
+```
+
+## Full test environment - Configure rate limits through an xDS Management Server
+
+To run a fully configured environment to demo Envoy based rate limiting, run:
+
+```bash
+export CONFIG_TYPE=GRPC_XDS_SOTW
+docker-compose -f docker-compose-example.yml --profile xds-config up --build --remove-orphans
+```
+
+This will run in `xds-config` docker-compose profile which will run example xDS-Server, ratelimit, redis, prom-statsd-exporter and two Envoy containers such that you can demo rate limiting by hitting the below endpoints.
+
+```bash
+curl localhost:8888/test
+curl localhost:8888/header -H "foo: foo" # Header based
+curl localhost:8888/twoheader -H "foo: foo" -H "bar: bar" # Two headers
+curl localhost:8888/twoheader -H "foo: foo" -H "baz: baz"  # This will be rate limited
+curl localhost:8888/twoheader -H "foo: foo" -H "bar: banned" # Ban a particular header value
+curl localhost:8888/twoheader -H "foo: foo" -H "baz: shady" # This will never be ratelimited since "baz" with value "shady" is in shadow_mode
+curl localhost:8888/twoheader -H "foo: foo" -H "baz: not-so-shady" # This is subject to rate-limiting because the it's now in shadow_mode
+```
+
+Edit[`examples/xds-sotw-config-server/resource.go`](examples/xds-sotw-config-server/resource.go) to test different rate limit configs.
 
 To see the metrics in the example
 
@@ -205,6 +244,7 @@ descriptors:
       unit: <see below: required>
       requests_per_unit: <see below: required>
     shadow_mode: (optional)
+    detailed_metric: (optional)
     descriptors: (optional block)
       - ... (nested repetition of above)
 ```
@@ -252,6 +292,12 @@ When a block is in ShadowMode all functions of the rate limiting service are exe
 An additional statistic is added to keep track of how many times a key with "shadow_mode" has overridden result.
 
 There is also a Global Shadow Mode
+
+### Including detailed metrics for unspecified values
+
+Setting the `detailed_metric: true` for a descriptor will extend the metrics that are produced. Normally a desriptor that matches a value that is not explicitly listed in the configuration will from a metrics point-of-view be rolled-up into the base entry. This can be probelmatic if you want to have those details available for analysis.
+
+NB! This should only be enabled in situations where the potentially large cardinality of metrics that this can lead to is acceptable.
 
 ### Examples
 
@@ -490,7 +536,75 @@ descriptors:
           unit: second
 ```
 
+#### Example 8
+
+In this example we demonstrate how a descriptor without a specified value is configured to override the default behavior and include the matched-value in the metrics.
+
+Rate limting configuration and tracking works as normally
+
+```
+(key_1, unspecified_value): 10 / sec
+(key_1, unspecified_value2): 10 / sec
+(key_1, value_1): 20 / sec
+```
+
+```yaml
+domain: example8
+descriptors:
+  - key: key1
+    detailed_metric: true
+    rate_limit:
+      unit: minute
+      requests_per_unit: 10
+  - key: key1
+    value: value1
+    rate_limit:
+      unit: minute
+      requests_per_unit: 20
+```
+
+The metrics keys will be the following:
+
+"key1_unspecified_value"
+"key1_unspecified_value2"
+"key1_value1"
+
+rather than the normal
+"key1"
+"key1_value1"
+
+#### Example 9
+
+Value supports wildcard matching to apply rate-limit for nested endpoints:
+
+```
+(key_1, value_1): 20 / sec
+(key_1, value_2): 20 / sec
+```
+
+```yaml
+domain: example9
+descriptors:
+  - key: key1
+    value: value*
+    rate_limit:
+      unit: minute
+      requests_per_unit: 20
+```
+
 ## Loading Configuration
+
+Rate limit service supports following configuration loading methods. You can define which methods to use by configuring environment variable `CONFIG_TYPE`.
+
+| Config Loading Method                                                             | Value for Environment Variable `CONFIG_TYPE` |
+| --------------------------------------------------------------------------------- | -------------------------------------------- |
+| [File Based Configuration Loading](#file-based-configuration-loading)             | `FILE` (Default)                             |
+| [xDS Server Based Configuration Loading](#xds-server-based-configuration-loading) | `GRPC_XDS_SOTW`                              |
+
+When the environment variable `FORCE_START_WITHOUT_INITIAL_CONFIG` set to `false`, the Rate limit service will wait for initial rate limit configuration before
+starting the server (gRPC, Rest server endpoints). When set to `true` the server will start even without initial configuration.
+
+### File Based Configuration Loading
 
 The Ratelimit service uses a library written by Lyft called [goruntime](https://github.com/lyft/goruntime) to do configuration loading. Goruntime monitors
 a designated path, and watches for symlink swaps to files in the directory tree to reload configuration files.
@@ -501,19 +615,20 @@ package with the following environment variables:
 ```
 RUNTIME_ROOT default:"/srv/runtime_data/current"
 RUNTIME_SUBDIRECTORY
+RUNTIME_APPDIRECTORY default:"config"
 RUNTIME_IGNOREDOTFILES default:"false"
 ```
 
-**Configuration files are loaded from RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/config/\*.yaml**
+**Configuration files are loaded from RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/RUNTIME_APPDIRECTORY/\*.yaml**
 
 There are two methods for triggering a configuration reload:
 
 1. Symlink RUNTIME_ROOT to a different directory.
-2. Update the contents inside `RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/config/` directly.
+2. Update the contents inside `RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/RUNTIME_APPDIRECTORY/` directly.
 
 The former is the default behavior. To use the latter method, set the `RUNTIME_WATCH_ROOT` environment variable to `false`.
 
-The following filesystem operations on configuration files inside `RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/config/` will force a reload of all config files:
+The following filesystem operations on configuration files inside `RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/RUNTIME_APPDIRECTORY/` will force a reload of all config files:
 
 - Write
 - Create
@@ -524,6 +639,36 @@ For more information on how runtime works you can read its [README](https://gith
 
 By default it is not possible to define multiple configuration files within `RUNTIME_SUBDIRECTORY` referencing the same domain.
 To enable this behavior set `MERGE_DOMAIN_CONFIG` to `true`.
+
+### xDS Management Server Based Configuration Loading
+
+xDS Management Server is a gRPC server which implements the [Aggregated Discovery Service (ADS)](https://github.com/envoyproxy/data-plane-api/blob/97b6dae39046f7da1331a4dc57830d20e842fc26/envoy/service/discovery/v3/ads.proto).
+The xDS Management server serves [Discovery Response](https://github.com/envoyproxy/data-plane-api/blob/97b6dae39046f7da1331a4dc57830d20e842fc26/envoy/service/discovery/v3/discovery.proto#L69) with [Ratelimit Configuration Resources](api/ratelimit/config/ratelimit/v3/rls_conf.proto)
+and with Type URL `"type.googleapis.com/ratelimit.config.ratelimit.v3.RateLimitConfig"`.
+The xDS client in the Rate limit service configure Rate limit service with the provided configuration.
+For more information on xDS protocol please refer to the [envoy proxy documentation](https://www.envoyproxy.io/docs/envoy/latest/api-docs/xds_protocol).
+
+You can refer to [the sample xDS configuration management server](examples/xds-sotw-config-server/README.md).
+
+The xDS server for listening for configuration can be set via [settings](https://github.com/envoyproxy/ratelimit/blob/master/src/settings/settings.go)
+package with the following environment variables:
+
+```
+CONFIG_GRPC_XDS_NODE_ID default:"default"
+CONFIG_GRPC_XDS_SERVER_URL default:"localhost:18000"
+CONFIG_GRPC_XDS_SERVER_CONNECT_RETRY_INTERVAL default:"3s"
+```
+
+As well Ratelimit supports TLS connections, these can be configured using the following environment variables:
+
+1. `CONFIG_GRPC_XDS_SERVER_USE_TLS`: set to `"true"` to enable a TLS connection with the xDS configuration management server.
+2. `CONFIG_GRPC_XDS_CLIENT_TLS_CERT`, `CONFIG_GRPC_XDS_CLIENT_TLS_KEY`, and `CONFIG_GRPC_XDS_SERVER_TLS_CACERT` to provides files to specify a TLS connection configuration to the xDS configuration management server.
+3. `CONFIG_GRPC_XDS_SERVER_TLS_SAN`: (Optional) Override the SAN value to validate from the server certificate.
+
+When using xDS you can configure extra headers that will be added to GRPC requests to the xDS Management server.
+Extra headers can be useful for providing additional authorization information. This can be configured using the following environment variable:
+
+`CONFIG_GRPC_XDS_CLIENT_ADDITIONAL_HEADERS` - set to `"<k1:v1>,<k2:v2>"` to add multiple headers to GRPC requests.
 
 ## Log Format
 
@@ -567,6 +712,31 @@ The behavior can be fixed by configuring the following env variables for the rat
 
 - `GRPC_MAX_CONNECTION_AGE`: a duration for the maximum amount of time a connection may exist before it will be closed by sending a GoAway. A random jitter of +/-10% will be added to MaxConnectionAge to spread out connection storms.
 - `GRPC_MAX_CONNECTION_AGE_GRACE`: an additive period after MaxConnectionAge after which the connection will be forcibly closed.
+
+## Health-check
+
+Health check status is determined internally by individual components.
+Currently, we have three components that determine the overall health status of the rate limit service.
+Each of the individual component's health needs to be healthy for the overall to report healthy.
+Some components may be turned OFF via configurations so overall health is not effected by that component's health status.
+
+- Redis health (Turned ON. Defaults to healthy)
+- Configuration status (Turned OFF unless configured to be ON via `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` see below section. Defaults to unhealthy)
+  - If the environment variable is enabled then, it will start in an unhealthy state and become healthy when at least one config is loaded. If we later fail to load any configs, it will go unhealthy again.
+- Sigterm (Turned ON. Defaults to healthy)
+  - Turns unhealthy if receives sigterm signal
+    All components needs to be healthy for overall health to be healthy.
+
+### Health-check configurations
+
+Health check can be configured to check if rate-limit configurations are loaded using the following environment variable.
+
+```
+HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED default:"false"`
+```
+
+If `HEALTHY_WITH_AT_LEAST_ONE_CONFIG_LOADED` is enabled then health check will start as unhealthy and becomes healthy if
+it detects at least one domain is loaded with the config. If it detects no config again then it will change to unhealthy.
 
 # Request Fields
 
@@ -622,6 +792,8 @@ KEY_VALUE:
 
 - A combination of the key value
 - Nested descriptors would be suffixed in the stats path
+
+The default mode is that the value-part is omitted if the rule that matches is a descriptor without a value. Specifying the `detailed_metric` configuration parameter changes this behavior and creates a unique metric even in this situation.
 
 STAT:
 
